@@ -13,6 +13,15 @@ subprojects {
           }
         }
       }
+      repositories {
+        maven { 
+          credentials {
+            username "$artifactory_user"
+            password "$artifactory_password"
+          }
+          url "$artifactory_url"
+	}
+      }
     }
   }
 }
