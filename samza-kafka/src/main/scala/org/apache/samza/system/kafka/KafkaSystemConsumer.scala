@@ -19,7 +19,6 @@
 
 package org.apache.samza.system.kafka
 
-import org.apache.samza.util.ClientUtilTopicMetadataStore
 import kafka.common.TopicAndPartition
 import grizzled.slf4j.Logging
 import kafka.message.MessageAndOffset
@@ -33,6 +32,12 @@ import org.apache.samza.util.BlockingEnvelopeMap
 import org.apache.samza.system.SystemStreamPartition
 import org.apache.samza.system.IncomingMessageEnvelope
 import kafka.consumer.ConsumerConfig
+import org.apache.samza.util.ExponentialSleepStrategy
+import org.apache.samza.SamzaException
+import org.apache.samza.util.TopicMetadataStore
+import org.apache.samza.util.ExponentialSleepStrategy
+import kafka.api.TopicMetadata
+import org.apache.samza.util.ExponentialSleepStrategy
 
 object KafkaSystemConsumer {
   def toTopicAndPartition(systemStreamPartition: SystemStreamPartition) = {
@@ -50,17 +55,32 @@ private[kafka] class KafkaSystemConsumer(
   systemName: String,
   brokerListString: String,
   metrics: KafkaSystemConsumerMetrics,
+  metadataStore: TopicMetadataStore,
   clientId: String = "undefined-client-id-%s" format UUID.randomUUID.toString,
   timeout: Int = ConsumerConfig.ConsumerTimeoutMs,
   bufferSize: Int = ConsumerConfig.SocketBufferSize,
-  fetchSize:Int = ConsumerConfig.MaxFetchSize,
-  consumerMinSize:Int = ConsumerConfig.MinFetchBytes,
-  consumerMaxWait:Int = ConsumerConfig.MaxFetchWaitMs,
-  brokerMetadataFailureRefreshMs: Long = 10000,
-  fetchThreshold: Int = 0,
+  fetchSize: Int = ConsumerConfig.MaxFetchSize,
+  consumerMinSize: Int = ConsumerConfig.MinFetchBytes,
+  consumerMaxWait: Int = ConsumerConfig.MaxFetchWaitMs,
+
+  /**
+   * Defines a low water mark for how many messages we buffer before we start
+   * executing fetch requests against brokers to get more messages. This value
+   * is divided equally among all registered SystemStreamPartitions. For
+   * example, if fetchThreshold is set to 50000, and there are 50
+   * SystemStreamPartitions registered, then the per-partition threshold is
+   * 1000. As soon as a SystemStreamPartition's buffered message count drops
+   * below 1000, a fetch request will be executed to get more data for it.
+   *
+   * Increasing this parameter will decrease the latency between when a queue
+   * is drained of messages and when new messages are enqueued, but also leads
+   * to an increase in memory usage since more messages will be held in memory.
+   */
+  fetchThreshold: Int = 50000,
   offsetGetter: GetOffset = new GetOffset("fail"),
   deserializer: Decoder[Object] = new DefaultDecoder().asInstanceOf[Decoder[Object]],
   keyDeserializer: Decoder[Object] = new DefaultDecoder().asInstanceOf[Decoder[Object]],
+  retryBackoff: ExponentialSleepStrategy = new ExponentialSleepStrategy,
   clock: () => Long = { System.currentTimeMillis }) extends BlockingEnvelopeMap(metrics.registry, new Clock {
   def currentTimeMillis = clock()
 }, classOf[KafkaSystemConsumerMetrics].getName) with Toss with Logging {
@@ -68,8 +88,13 @@ private[kafka] class KafkaSystemConsumer(
   type HostPort = (String, Int)
   val brokerProxies = scala.collection.mutable.Map[HostPort, BrokerProxy]()
   var nextOffsets = Map[SystemStreamPartition, String]()
+  var perPartitionFetchThreshold = fetchThreshold
 
   def start() {
+    if (nextOffsets.size > 0) {
+      perPartitionFetchThreshold = fetchThreshold / nextOffsets.size
+    }
+
     val topicPartitionsAndOffsets = nextOffsets.map {
       case (systemStreamPartition, offset) =>
         val topicAndPartition = KafkaSystemConsumer.toTopicAndPartition(systemStreamPartition)
@@ -77,8 +102,6 @@ private[kafka] class KafkaSystemConsumer(
     }
 
     refreshBrokers(topicPartitionsAndOffsets)
-
-    brokerProxies.values.foreach(_.start)
   }
 
   override def register(systemStreamPartition: SystemStreamPartition, offset: String) {
@@ -93,60 +116,58 @@ private[kafka] class KafkaSystemConsumer(
     brokerProxies.values.foreach(_.stop)
   }
 
+  protected def createBrokerProxy(host: String, port: Int): BrokerProxy = {
+    new BrokerProxy(host, port, systemName, clientId, metrics, sink, timeout, bufferSize, fetchSize, consumerMinSize, consumerMaxWait, offsetGetter)
+  }
+
+  protected def getHostPort(topicMetadata: TopicMetadata, partition: Int): Option[(String, Int)] = {
+    // Whatever we do, we can't say Broker, even though we're
+    // manipulating it here. Broker is a private type and Scala doesn't seem
+    // to care about that as long as you don't explicitly declare its type.
+    val brokerOption = topicMetadata
+      .partitionsMetadata
+      .find(_.partitionId == partition)
+      .flatMap(_.leader)
+
+    brokerOption match {
+      case Some(broker) => Some(broker.host, broker.port)
+      case _ => None
+    }
+  }
+
   def refreshBrokers(topicPartitionsAndOffsets: Map[TopicAndPartition, String]) {
     var tpToRefresh = topicPartitionsAndOffsets.keySet.toList
-    while (!tpToRefresh.isEmpty) {
-      try {
-        val getTopicMetadata = (topics: Set[String]) => {
-          new ClientUtilTopicMetadataStore(brokerListString, clientId).getTopicInfo(topics)
-        }
+    retryBackoff.run(
+      loop => {
         val topics = tpToRefresh.map(_.topic).toSet
-        val partitionMetadata = TopicMetadataCache.getTopicMetadata(topics, systemName, getTopicMetadata)
+        val topicMetadata = TopicMetadataCache.getTopicMetadata(topics, systemName, (topics: Set[String]) => metadataStore.getTopicInfo(topics))
 
         // addTopicPartition one at a time, leaving the to-be-done list intact in case of exceptions.
         // This avoids trying to re-add the same topic partition repeatedly
-        def refresh(tp:List[TopicAndPartition]) = {
+        def refresh(tp: List[TopicAndPartition]) = {
           val head :: rest = tpToRefresh
           val nextOffset = topicPartitionsAndOffsets.get(head).get
-          // Whatever we do, we can't say Broker, even though we're
-          // manipulating it here. Broker is a private type and Scala doesn't seem
-          // to care about that as long as you don't explicitly declare its type.
-          val brokerOption = partitionMetadata(head.topic)
-                             .partitionsMetadata
-                             .find(_.partitionId == head.partition)
-                             .flatMap(_.leader)
-
-          brokerOption match {
-            case Some(broker) =>
-              def createBrokerProxy = new BrokerProxy(broker.host, broker.port, systemName, clientId, metrics, sink, timeout, bufferSize, fetchSize, consumerMinSize, consumerMaxWait, offsetGetter)
-
-              brokerProxies
-                .getOrElseUpdate((broker.host, broker.port), createBrokerProxy)
-                .addTopicPartition(head, Option(nextOffset))
+          getHostPort(topicMetadata(head.topic), head.partition) match {
+            case Some((host, port)) =>
+              val brokerProxy = brokerProxies.getOrElseUpdate((host, port), createBrokerProxy(host, port))
+              brokerProxy.addTopicPartition(head, Option(nextOffset))
+              brokerProxy.start
             case None => warn("No such topic-partition: %s, dropping." format head)
           }
           rest
         }
 
-
-        while(!tpToRefresh.isEmpty) {
+        while (!tpToRefresh.isEmpty) {
           tpToRefresh = refresh(tpToRefresh)
         }
-      } catch {
-        case e: Throwable =>
-          warn("An exception was thrown while refreshing brokers for %s. Waiting a bit and retrying, since we can't continue without broker metadata." format tpToRefresh.head)
-          debug("Exception while refreshing brokers", e)
 
-          try {
-            Thread.sleep(brokerMetadataFailureRefreshMs)
-          } catch {
-            case e: InterruptedException =>
-              info("Interrupted while waiting to retry metadata refresh, so shutting down.")
+        loop.done
+      },
 
-              stop
-          }
-      }
-    }
+      (loop, exception) => {
+        warn("While refreshing brokers for %s: %s. Retrying." format (tpToRefresh.head, exception))
+        debug(exception)
+      })
   }
 
   val sink = new MessageSink {
@@ -155,7 +176,7 @@ private[kafka] class KafkaSystemConsumer(
     }
 
     def needsMoreMessages(tp: TopicAndPartition) = {
-      getNumMessagesInQueue(toSystemStreamPartition(tp)) <= fetchThreshold
+      getNumMessagesInQueue(toSystemStreamPartition(tp)) <= perPartitionFetchThreshold
     }
 
     def addMessage(tp: TopicAndPartition, msg: MessageAndOffset, highWatermark: Long) = {

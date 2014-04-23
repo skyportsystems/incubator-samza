@@ -38,7 +38,7 @@ import org.apache.samza.util.ExponentialSleepStrategy
  *  Companion object for class JvmMetrics encapsulating various constants
  */
 object BrokerProxy {
-  val BROKER_PROXY_THREAD_NAME_PREFIX = "BROKER-PROXY"
+  val BROKER_PROXY_THREAD_NAME_PREFIX = "BROKER-PROXY-"
 }
 
 /**
@@ -62,7 +62,7 @@ class BrokerProxy(
   /**
    * How long should the fetcher thread sleep before checking if any TopicPartitions has been added to its purview
    */
-  val sleepMSWhileNoTopicPartitions = 1000
+  val sleepMSWhileNoTopicPartitions = 100
 
   /** What's the next offset for a particular partition? **/
   val nextOffsets:mutable.ConcurrentMap[TopicAndPartition, Long] = new ConcurrentHashMap[TopicAndPartition, Long]()
@@ -122,38 +122,45 @@ class BrokerProxy(
     }
   }
 
-  val thread: Thread = new Thread(new Runnable() {
-    def run() {
-      info("Initialising sleep strategy");
-      val sleepStrategy = new ExponentialSleepStrategy
-      info("Starting thread for BrokerProxy")
+  val thread = new Thread(new Runnable {
+    def run {
+      var reconnect = false
 
-      while (!Thread.currentThread.isInterrupted) {
-        if (nextOffsets.size == 0) {
-          debug("No TopicPartitions to fetch. Sleeping.")
-          Thread.sleep(sleepMSWhileNoTopicPartitions)
-        } else {
-          try {
-            fetchMessages()
-          } catch {
-            // If we're interrupted, don't try and reconnect. We should shut down.
-            case e: InterruptedException =>
-              warn("Shutting down due to interrupt exception.")
-              Thread.currentThread.interrupt
-            case e: ClosedByInterruptException =>
-              warn("Shutting down due to closed by interrupt exception.")
-              Thread.currentThread.interrupt
-            case e: Throwable => {
-              warn("Recreating simple consumer and retrying connection")
-              warn("Stack trace for fetchMessages exception.", e)
-              simpleConsumer.close()
-              sleepStrategy.sleep()
-              simpleConsumer = createSimpleConsumer()
+      try {
+        (new ExponentialSleepStrategy).run(
+          loop => {
+            if (reconnect) {
               metrics.reconnects(host, port).inc
+              simpleConsumer.close()
+              simpleConsumer = createSimpleConsumer()
             }
-          }
-        }
+
+            while (!Thread.currentThread.isInterrupted) {
+              if (nextOffsets.size == 0) {
+                debug("No TopicPartitions to fetch. Sleeping.")
+                Thread.sleep(sleepMSWhileNoTopicPartitions)
+              } else {
+                fetchMessages
+
+                // If we got here, fetchMessages didn't throw an exception, i.e. it was successful.
+                // In that case, reset the loop delay, so that the next time an error occurs,
+                // we start with a short retry delay.
+                loop.reset
+              }
+            }
+          },
+
+          (exception, loop) => {
+            warn("Restarting consumer due to %s. Turn on debugging to get a full stack trace." format exception)
+            debug(exception)
+            reconnect = true
+          })
+      } catch {
+        case e: InterruptedException => info("Got interrupt exception in broker proxy thread.")
+        case e: ClosedByInterruptException => info("Got closed by interrupt exception in broker proxy thread.")
       }
+
+      if (Thread.currentThread.isInterrupted) info("Shutting down due to interrupt.")
     }
   }, "BrokerProxy thread pointed at %s:%d for client %s" format (host, port, clientID))
 
@@ -224,7 +231,6 @@ class BrokerProxy(
         // UnknownTopic or NotLeader are routine events and handled via abdication.  All others, bail.
         case _ @ (_:UnknownTopicOrPartitionException | _: NotLeaderForPartitionException) => warn("Received (UnknownTopicOr|NotLeaderFor)Partition exception. Abdicating")
                                                                                              abdicate(e.tp)
-        case other => throw other
       }
     })
   }
@@ -262,9 +268,13 @@ class BrokerProxy(
   def start {
     info("Starting " + toString)
 
-    thread.setDaemon(true)
-    thread.setName(SAMZA_THREAD_NAME_PREFIX+BrokerProxy.BROKER_PROXY_THREAD_NAME_PREFIX)
-    thread.start
+    if (!thread.isAlive) {
+      thread.setDaemon(true)
+      thread.setName(SAMZA_THREAD_NAME_PREFIX + BrokerProxy.BROKER_PROXY_THREAD_NAME_PREFIX + thread.getName)
+      thread.start
+    } else {
+      debug("Tried to start an already started broker proxy (%s). Ignoring." format toString)
+    }
   }
 
   def stop {

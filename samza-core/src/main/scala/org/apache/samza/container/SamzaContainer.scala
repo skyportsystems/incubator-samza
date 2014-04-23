@@ -63,6 +63,7 @@ import scala.collection.JavaConversions._
 import org.apache.samza.system.SystemAdmin
 import org.apache.samza.system.SystemStreamMetadata
 import org.apache.samza.checkpoint.OffsetManager
+import org.apache.samza.system.StreamMetadataCache
 
 object SamzaContainer extends Logging {
   def main(args: Array[String]) {
@@ -72,7 +73,7 @@ object SamzaContainer extends Logging {
     val config = JsonConfigSerializer.fromJson(configStr)
     val encodedStreamsAndPartitions = System.getenv(ShellCommandConfig.ENV_SYSTEM_STREAMS)
 
-    val partitions = Util.createStreamPartitionsFromString(encodedStreamsAndPartitions)
+    val partitions = Util.deserializeSSPSetFromJSON(encodedStreamsAndPartitions)
 
     if (partitions.isEmpty) {
       throw new SamzaException("No partitions for this task. Can't run a task without partition assignments. It's likely that the partition manager for this system doesn't know about the stream you're trying to read.")
@@ -122,7 +123,8 @@ object SamzaContainer extends Logging {
 
     info("Got system factories: %s" format systemFactories.keys)
 
-    val inputStreamMetadata = getStreamMetadata(inputStreams.map(_.getSystemStream), systemAdmins)
+    val streamMetadataCache = new StreamMetadataCache(systemAdmins)
+    val inputStreamMetadata = streamMetadataCache.getStreamMetadata(inputStreams.map(_.getSystemStream))
 
     info("Got input stream metadata: %s" format inputStreamMetadata)
 
@@ -133,7 +135,7 @@ object SamzaContainer extends Logging {
         try {
           (systemName, systemFactory.getConsumer(systemName, config, samzaContainerMetrics.registry))
         } catch {
-          case e: Throwable =>
+          case e: Exception =>
             info("Failed to create a consumer for %s, so skipping." format systemName)
             debug(e)
             (systemName, null)
@@ -150,7 +152,7 @@ object SamzaContainer extends Logging {
           try {
             (systemName, systemFactory.getProducer(systemName, config, samzaContainerMetrics.registry))
           } catch {
-            case e: Throwable =>
+            case e: Exception =>
               info("Failed to create a producer for %s, so skipping." format systemName)
               debug(e)
               (systemName, null)
@@ -224,7 +226,7 @@ object SamzaContainer extends Logging {
 
     info("Got change log system streams: %s" format changeLogSystemStreams)
 
-    val changeLogMetadata = getStreamMetadata(changeLogSystemStreams.values.toSet, systemAdmins)
+    val changeLogMetadata = streamMetadataCache.getStreamMetadata(changeLogSystemStreams.values.toSet)
 
     info("Got change log stream metadata: %s" format changeLogMetadata)
 
@@ -445,25 +447,6 @@ object SamzaContainer extends Logging {
   }
 
   /**
-   * Builds a map from SystemStream to SystemStreamMetadata for all streams
-   * using SystemAdmins to fetch metadata.
-   */
-  def getStreamMetadata(streams: Set[SystemStream], systemAdmins: Map[String, SystemAdmin]): Map[SystemStream, SystemStreamMetadata] = {
-    streams
-      .groupBy[String](_.getSystem)
-      .flatMap {
-        case (systemName, systemStreams) =>
-          systemAdmins
-            .getOrElse(systemName, throw new SamzaException("Unable to find system admin definition for system %s." format systemName))
-            .getSystemStreamMetadata(systemStreams.map(_.getStream))
-            .map {
-              case (streamName, metadata) => (new SystemStream(systemName, streamName), metadata)
-            }
-      }
-      .toMap
-  }
-
-  /**
    * Builds a map from SystemStreamPartition to oldest offset for changelogs.
    */
   def getChangeLogOldestOffsetsForPartition(partition: Partition, inputStreamMetadata: Map[SystemStream, SystemStreamMetadata]): Map[SystemStream, String] = {
@@ -512,7 +495,7 @@ class SamzaContainer(
         }
       }
     } catch {
-      case e: Throwable =>
+      case e: Exception =>
         error("Caught exception in process loop.", e)
         throw e
     } finally {

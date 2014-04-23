@@ -117,7 +117,7 @@ object TestKafkaSystemAdmin {
 
         done = expectedPartitionCount == topicMetadata.partitionsMetadata.size
       } catch {
-        case e: Throwable =>
+        case e: Exception =>
           System.err.println("Got exception while validating test topics. Waiting and retrying.", e)
           retries += 1
           Thread.sleep(500)
@@ -299,27 +299,15 @@ class TestKafkaSystemAdmin {
     }
   }
 
-  class CallLimitReached extends Exception
-
-  class MockSleepStrategy(maxCalls: Int) extends ExponentialSleepStrategy {
-    var countCalls = 0
-
-    override def sleep() = {
-      if (countCalls >= maxCalls) throw new CallLimitReached
-      countCalls += 1
-    }
-  }
-
   @Test
   def testShouldRetryOnTopicMetadataError {
     val systemAdmin = new KafkaSystemAdminWithTopicMetadataError
-    val retryBackoff = new MockSleepStrategy(maxCalls = 3)
+    val retryBackoff = new ExponentialSleepStrategy.Mock(maxCalls = 3)
     try {
       systemAdmin.getSystemStreamMetadata(Set("quux"), retryBackoff)
+      fail("expected CallLimitReached to be thrown")
     } catch {
-      case e: CallLimitReached => () // this would be less ugly if we were using scalatest
-      case e: Throwable => throw e
+      case e: ExponentialSleepStrategy.CallLimitReached => ()
     }
-    assertEquals(retryBackoff.countCalls, 3)
   }
 }

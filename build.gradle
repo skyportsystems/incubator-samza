@@ -8,8 +8,7 @@ buildscript {
 
 allprojects {
   repositories {
-    // Required for Kafka. Kafka's 0.8.0-beta1 Maven Central
-    // POM is broken. Should go away in future releases.
+    // Required for Kafka.
     maven {
       url 'https://repository.apache.org/content/groups/public'
     }
@@ -25,17 +24,18 @@ apply from: file("gradle/dependency-versions-scala-" + scalaVersion + ".gradle")
 
 allprojects {
   apply plugin: 'idea'
+
+  // For all scala compilation, add extra compiler options, taken from version-specific
+  // dependency-versions-scala file applied above.
+  tasks.withType(ScalaCompile) {
+    scalaCompileOptions.additionalParameters = [ scalaOptions ]
+  }
 }
 
+
 subprojects {
-  apply plugin: 'jacoco'
   apply plugin: 'eclipse'
   apply plugin: 'project-report'
-
-  // Required for now, becaues of GRADLE-2917.
-  dependencies {
-    jacocoAgent "org.jacoco:org.jacoco.agent:${jacoco.toolVersion}"
-  }
 }
 
 project(':samza-api') {
@@ -56,11 +56,20 @@ project(":samza-core_$scalaVersion") {
     compile "net.sf.jopt-simple:jopt-simple:$joptSimpleVersion"
     compile "org.codehaus.jackson:jackson-jaxrs:$jacksonVersion"
     testCompile "junit:junit:$junitVersion"
+    testCompile "org.mockito:mockito-all:$mockitoVersion"
+    testCompile "org.scalatest:scalatest_$scalaVersion:$scalaTestVersion"
   }
 }
 
 project(":samza-kafka_$scalaVersion") {
   apply plugin: 'scala'
+
+  configurations {
+    // Remove transitive dependencies from Zookeeper that we don't want.
+    compile.exclude group: 'javax.jms', module: 'jms'
+    compile.exclude group: 'com.sun.jdmk', module: 'jmxtools'
+    compile.exclude group: 'com.sun.jmx', module: 'jmxri'
+  }
 
   dependencies {
     compile project(':samza-api')
@@ -69,25 +78,21 @@ project(":samza-kafka_$scalaVersion") {
     compile "org.scala-lang:scala-library:$scalaLibVersion"
     compile "org.clapper:grizzled-slf4j_$scalaVersion:$grizzledVersion"
     compile "com.101tec:zkclient:$zkClientVersion"
+    compile "org.apache.zookeeper:zookeeper:$zookeeperVersion"
     compile "org.codehaus.jackson:jackson-jaxrs:$jacksonVersion"
-    // these can all go away when kafka is in maven
-    compile files("lib/kafka_$scalaVersion-" + kafkaVersion + ".jar")
-    compile "com.yammer.metrics:metrics-core:$metricsVersion"
-    compile "com.yammer.metrics:metrics-annotation:$metricsVersion"
-    // end these can all go away when kafka is in maven
+    compile "org.apache.kafka:kafka_$scalaVersion:$kafkaVersion"
     testCompile "junit:junit:$junitVersion"
     testCompile "org.mockito:mockito-all:$mockitoVersion"
-    // these can all go away when kafka is in maven
-    testCompile files("lib/kafka_$scalaVersion-$kafkaVersion-test.jar")
-    // end these can all go away when kafka is in maven
+    // TODO replace this with an official release, if possible
+    testCompile files("lib/kafka_$scalaVersion-0.8.1-SNAPSHOT-test.jar")
 
     // Logging in tests is good.
-    testRuntime "org.slf4j:slf4j-simple:1.6.2"
+    testRuntime "org.slf4j:slf4j-simple:$slf4jVersion"
   }
 
   test {
     // Bump up the heap so we can start ZooKeeper and Kafka brokers.
-    maxHeapSize = "1024m"
+    maxHeapSize = "2048m"
   }
 }
 
@@ -140,6 +145,7 @@ project(":samza-yarn_$scalaVersion") {
       exclude module: 'slf4j-api'
     }
     testCompile "junit:junit:$junitVersion"
+    testCompile "org.mockito:mockito-all:$mockitoVersion"
   }
 
   repositories {
@@ -152,10 +158,38 @@ project(":samza-yarn_$scalaVersion") {
 project(":samza-shell") {
   apply plugin: 'java'
 
+  configurations {
+    gradleShell
+  }
+
+  dependencies {
+    gradleShell project(":samza-core_$scalaVersion")
+    gradleShell project(":samza-kafka_$scalaVersion")
+    gradleShell project(":samza-yarn_$scalaVersion")
+    gradleShell "org.slf4j:slf4j-simple:$slf4jVersion"
+  }
+
   task shellTarGz(type: Tar) { 
     compression = Compression.GZIP 
     classifier = 'dist'
     from 'src/main/bash'
+  }
+
+  // Usage: ./gradlew samza-shell:runJob \
+  //    -PconfigPath=file:///path/to/job/config.properties
+  task runJob(type:JavaExec) {
+    main = 'org.apache.samza.job.JobRunner'
+    classpath = configurations.gradleShell
+    if (project.hasProperty('configPath')) args += ['--config-path', configPath]
+  }
+
+  // Usage: ./gradlew samza-shell:checkpointTool \
+  //    -PconfigPath=file:///path/to/job/config.properties -PnewOffsets=file:///path/to/new/offsets.properties
+  task checkpointTool(type:JavaExec) {
+    main = 'org.apache.samza.checkpoint.CheckpointTool'
+    classpath = configurations.gradleShell
+    if (project.hasProperty('configPath')) args += ['--config-path', configPath]
+    if (project.hasProperty('newOffsets')) args += ['--new-offsets', newOffsets]
   }
 }
 
@@ -177,6 +211,13 @@ project(":samza-kv_$scalaVersion") {
 project(":samza-test_$scalaVersion") {
   apply plugin: 'scala'
 
+  configurations {
+    // Remove transitive dependencies from Zookeeper that we don't want.
+    compile.exclude group: 'javax.jms', module: 'jms'
+    compile.exclude group: 'com.sun.jdmk', module: 'jmxtools'
+    compile.exclude group: 'com.sun.jmx', module: 'jmxri'
+  }
+
   dependencies {
     compile project(':samza-api')
     compile project(":samza-kv_$scalaVersion")
@@ -186,11 +227,12 @@ project(":samza-test_$scalaVersion") {
     compile "net.sf.jopt-simple:jopt-simple:$joptSimpleVersion"
     compile "javax.mail:mail:1.4"
     compile "junit:junit:$junitVersion"
-    compile files("../samza-kafka/lib/kafka_$scalaVersion-" + kafkaVersion + ".jar")
-    testCompile files("../samza-kafka/lib/kafka_$scalaVersion-" + kafkaVersion + "-test.jar")
+    compile "org.apache.kafka:kafka_$scalaVersion:$kafkaVersion"
+    // TODO replace this with an official release, if possible
+    testCompile files("../samza-kafka/lib/kafka_$scalaVersion-0.8.1-SNAPSHOT-test.jar")
     testCompile "com.101tec:zkclient:$zkClientVersion"
     testCompile project(":samza-kafka_$scalaVersion")
-    testRuntime "org.slf4j:slf4j-simple:1.6.2"
+    testRuntime "org.slf4j:slf4j-simple:$slf4jVersion"
   }
 
   test {
