@@ -92,7 +92,9 @@ project(":samza-kafka_$scalaVersion") {
 
   test {
     // Bump up the heap so we can start ZooKeeper and Kafka brokers.
-    maxHeapSize = "2048m"
+    minHeapSize = "4096m"
+    maxHeapSize = "4096m"
+    jvmArgs = ["-XX:+UseConcMarkSweepGC", "-server", "-d64"]
   }
 }
 
@@ -144,6 +146,7 @@ project(":samza-yarn_$scalaVersion") {
       exclude module: 'scala-compiler'
       exclude module: 'slf4j-api'
     }
+    compile "joda-time:joda-time:$jodaTimeVersion"
     testCompile "junit:junit:$junitVersion"
     testCompile "org.mockito:mockito-all:$mockitoVersion"
   }
@@ -165,6 +168,7 @@ project(":samza-shell") {
   dependencies {
     gradleShell project(":samza-core_$scalaVersion")
     gradleShell project(":samza-kafka_$scalaVersion")
+    gradleShell project(":samza-test_$scalaVersion")
     gradleShell project(":samza-yarn_$scalaVersion")
     gradleShell "org.slf4j:slf4j-simple:$slf4jVersion"
   }
@@ -190,6 +194,14 @@ project(":samza-shell") {
     classpath = configurations.gradleShell
     if (project.hasProperty('configPath')) args += ['--config-path', configPath]
     if (project.hasProperty('newOffsets')) args += ['--new-offsets', newOffsets]
+  }
+
+  // Usage: ./gradlew samza-shell:kvPerformanceTest
+  //    -PconfigPath=file:///path/to/job/config.properties
+  task kvPerformanceTest(type:JavaExec) {
+    main = 'org.apache.samza.test.performance.TestKeyValuePerformance'
+    classpath = configurations.gradleShell
+    if (project.hasProperty('configPath')) args += ['--config-path', configPath]
   }
 }
 
@@ -239,7 +251,9 @@ project(":samza-test_$scalaVersion") {
     // Bump up the heap so we can start ZooKeeper and Kafka brokers. Also 
     // required for TestSamzaContainerPerformance when a high thread count 
     // with a lot of inputs is used.
+    minHeapSize = "4096m"
     maxHeapSize = "4096m"
+    jvmArgs = ["-XX:+UseConcMarkSweepGC", "-server", "-d64"]
 
     // Forward all samza.* system properties to test subprocesses. This is 
     // useful for configuring TestSamzaContainerPerformance from the CLI.
